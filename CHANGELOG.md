@@ -1,5 +1,12 @@
 # Changelog
 
+## 1.0.1 — 2026-11-21
+
+- Accept exported lines containing `(SET)` codes and collector numbers, including PLST codes such as `CM2-235`.
+- Accept known double-faced and split card pairs written with a single slash.
+- Normalize Unicode accents while preserving Forge's canonical card names.
+- Preserve exact card titles containing parentheses or literal slash characters, and merge printed and plain entries for the same card.
+
 ## 1.0.0 — 2026-11-21
 
 Initial public release.

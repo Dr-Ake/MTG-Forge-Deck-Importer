@@ -31,16 +31,24 @@ namespace ForgeDeckImporter
     {
         public readonly Dictionary<string, CardInfo> Cards = new Dictionary<string, CardInfo>(StringComparer.OrdinalIgnoreCase);
         private readonly Dictionary<string, CardInfo> aliases = new Dictionary<string, CardInfo>(StringComparer.OrdinalIgnoreCase);
+        private static readonly Regex PrintingSuffix = new Regex(@"\s+\([A-Za-z0-9]{2,10}\)\s+(?=[A-Za-z0-9.\-/]*\d)[A-Za-z0-9]+(?:[-./][A-Za-z0-9]+)*(?:\s+\*[FE]\*)?\s*$", RegexOptions.Compiled | RegexOptions.IgnoreCase);
 
         public static string Normalize(string text)
         {
-            return Regex.Replace(text.Trim().Replace('\u2019', '\'').Replace('\u2018', '\'').Replace('\u201c', '"').Replace('\u201d', '"'), @"\s*//\s*", " // ");
+            return text.Trim().Replace('\t', ' ').Replace('\u2019', '\'').Replace('\u2018', '\'').Replace('\u201c', '"').Replace('\u201d', '"').Normalize(NormalizationForm.FormC);
+        }
+
+        private static string FacePairKey(string text)
+        {
+            return Regex.Replace(Normalize(text), @"\s*/\s*", "/");
         }
 
         public bool TryResolve(string name, out CardInfo card)
         {
             string key = Normalize(name);
-            return Cards.TryGetValue(key, out card) || aliases.TryGetValue(key, out card);
+            if (Cards.TryGetValue(key, out card) || aliases.TryGetValue(FacePairKey(key), out card)) return true;
+            string withoutPrinting = PrintingSuffix.Replace(key, "");
+            return !String.Equals(key, withoutPrinting, StringComparison.Ordinal) && (Cards.TryGetValue(withoutPrinting, out card) || aliases.TryGetValue(FacePairKey(withoutPrinting), out card));
         }
 
         public CardInfo AddFaces(List<string> faces, string types, string alternateMode, string frontRules = "")
@@ -55,7 +63,11 @@ namespace ForgeDeckImporter
             bool explicitCommander = frontRules.Split('\n').Any(line => line.StartsWith("Oracle:", StringComparison.Ordinal) && line.IndexOf("can be your commander", StringComparison.OrdinalIgnoreCase) >= 0);
             CardInfo card = new CardInfo { Name = canonical, Basic = Regex.IsMatch(types, @"\bBasic\b"), Land = Regex.IsMatch(types, @"\bLand\b"), CommanderCandidate = !Regex.IsMatch(types, @"\bBackground\b") && (explicitCommander || (legendary && (creature || vehicle || spacecraft))) };
             Cards[Normalize(canonical)] = card;
-            if (combined != null && !String.Equals(combined, canonical, StringComparison.OrdinalIgnoreCase)) aliases[Normalize(combined)] = card;
+            if (combined != null)
+            {
+                aliases[FacePairKey(combined)] = card;
+                aliases[FacePairKey(faces[0] + " / " + faces[1])] = card;
+            }
             return card;
         }
 
@@ -124,7 +136,7 @@ namespace ForgeDeckImporter
                     throw new InvalidOperationException("Line " + (index + 1) + " needs a positive quantity and card name, for example: 1 Sol Ring.");
                 string name = Catalog.Normalize(match.Groups[2].Value);
                 if (name.Length == 0 || name.Length > 250 || name.IndexOf('|') >= 0 || name.Any(Char.IsControl))
-                    throw new InvalidOperationException("Line " + (index + 1) + " contains an invalid card name. Paste card names without set codes or collector numbers.");
+                    throw new InvalidOperationException("Line " + (index + 1) + " contains an invalid card name. Use a card name, optionally followed by (SET) and a collector number.");
                 CardEntry existing;
                 if (byName.TryGetValue(name, out existing)) existing.Quantity = checked(existing.Quantity + quantity);
                 else
@@ -537,10 +549,34 @@ namespace ForgeDeckImporter
             MustFail(delegate { DeckParser.Parse("1 Mountain\naccidental prose"); }, "Invalid line was silently dropped.");
             List<CardEntry> tabbed = DeckParser.Validate("99x\tMountain\\\n1x\tTest Commander\\", "Test Commander", catalog);
             Assert(tabbed.Sum(e => e.Quantity) == 100 && DeckWriter.Format("Tabbed deck", "Test Commander", tabbed).Contains("[Commander]\r\n1 Test Commander\r\n[Main]\r\n99 Mountain"), "Tabbed x quantities or a commander later in the list failed.");
+            List<CardEntry> printed = DeckParser.Validate("1 Test Commander (LCI) 224\\\r\n99x\tMountain\t(PLST)\tCM2-235\\", "Test Commander (LCI) 224", catalog);
+            Assert(printed[0].Name == "Test Commander" && printed[1].Name == "Mountain" && printed.Sum(e => e.Quantity) == 100, "Set and collector suffixes or tab-separated printing details were not accepted.");
+            CardInfo printingCard;
+            foreach (string collector in new[] { "224", "CM2-235", "M15-5", "VOW-103", "RAV-83", "C17-65", "CLB-151", "GNT-36", "123a" }) Assert(catalog.TryResolve("Mountain (PLST) " + collector, out printingCard) && printingCard.Name == "Mountain", "Collector code was not recognized: " + collector);
+            Assert(catalog.TryResolve("Mountain (TST) 123 *F*", out printingCard), "Foil printing marker was not recognized.");
+            catalog.AddFaces(new List<string> { "Real Title (ABC) 123" }, "Legendary Creature", "");
+            Assert(catalog.TryResolve("Real Title (ABC) 123", out printingCard) && printingCard.Name == "Real Title (ABC) 123", "A real card title was mistaken for printing metadata.");
+            Assert(catalog.TryResolve("Real Title (ABC) 123 (PLST) CM2-235", out printingCard) && printingCard.Name == "Real Title (ABC) 123", "Printing fallback damaged a title containing parentheses.");
+            MustFail(delegate { DeckParser.Validate("1 Test Commander\n1 Test Commander (TST) 123\n98 Mountain", "Test Commander", catalog); }, "Printed and plain copies of the same commander were not combined.");
+            MustFail(delegate { DeckParser.Validate("1 Test Commander\n1 Misspelled Card (LCI) 224\n98 Mountain", "Test Commander", catalog); }, "Printing metadata caused an unknown card to be accepted.");
+            catalog.AddFaces(new List<string> { "Bartolom\u00e9 del Presidio" }, "Legendary Creature", "");
+            List<CardEntry> accented = DeckParser.Validate("1 Bartolome\u0301 del Presidio (LCI) 224\n99 Mountain (BRO) 268", "Bartolome\u0301 del Presidio (LCI) 224", catalog);
+            Assert(accented[0].Name == "Bartolom\u00e9 del Presidio", "Composed and decomposed Unicode accents did not resolve to the same name.");
             catalog.AddFaces(new List<string> { "Howlpack Piper", "Wildsong Howler" }, "Creature Human Werewolf", "DoubleFaced");
             catalog.AddFaces(new List<string> { "Fire", "Ice" }, "Instant", "Split");
             catalog.AddFaces(new List<string> { "Bonecrusher Giant", "Stomp" }, "Creature Giant", "Adventure");
             catalog.AddFaces(new List<string> { "Test Modal Front", "Test Modal Back" }, "Land", "Modal");
+            catalog.AddFaces(new List<string> { "Dusk", "Dawn" }, "Sorcery", "Split");
+            catalog.AddFaces(new List<string> { "Throne of the Grim Captain", "The Grim Captain" }, "Legendary Artifact", "DoubleFaced");
+            List<CardEntry> singleSlashes = DeckParser.Validate("1 Test Commander (LCI) 224\n1 Dusk / Dawn (BLC) 138\n1 Throne of the Grim Captain / The Grim Captain (LCI) 266\n97 Mountain (BRO) 268", "Test Commander", catalog);
+            string singleSlashDeck = DeckWriter.Format("Printing export", "Test Commander", singleSlashes);
+            Assert(singleSlashDeck.Contains("1 Dusk // Dawn\r\n") && singleSlashDeck.Contains("1 Throne of the Grim Captain\r\n") && !singleSlashDeck.Contains("(BLC)"), "Single-slash face names with printing details were not serialized correctly.");
+            catalog.AddFaces(new List<string> { "Summon: Choco/Mog" }, "Enchantment Creature", "");
+            catalog.AddFaces(new List<string> { "SP//dr, Piloted by Peni" }, "Legendary Artifact Vehicle", "");
+            Assert(catalog.TryResolve("Summon: Choco/Mog (FIC) 99", out printingCard) && printingCard.Name == "Summon: Choco/Mog", "A literal slash in a real title was changed.");
+            Assert(catalog.TryResolve("SP//dr, Piloted by Peni (TMT) 123", out printingCard) && printingCard.Name == "SP//dr, Piloted by Peni", "A literal double slash in a real title was changed.");
+            Assert(!catalog.TryResolve("Summon: Choco / Mog", out printingCard) && !catalog.TryResolve("SP / dr, Piloted by Peni", out printingCard), "A face alias was invented for a literal slash title.");
+            MustFail(delegate { DeckParser.Validate("1 Test Commander\n1 Throne of the Grim Captain / Wrong Face (LCI) 266\n98 Mountain", "Test Commander", catalog); }, "Printing details hid an incorrect back face.");
             List<CardEntry> faces = DeckParser.Validate("1 Test Commander\n1x\tHowlpack Piper//Wildsong Howler\\\n1 Fire // Ice\n1 Bonecrusher Giant // Stomp\n1 Test Modal Front // Test Modal Back\n95 Mountain", "Test Commander", catalog);
             string faceDeck = DeckWriter.Format("Faces", "Test Commander", faces);
             Assert(faceDeck.Contains("1 Howlpack Piper\r\n") && !faceDeck.Contains("Wildsong Howler"), "Double-faced names were not serialized as Forge front names.");
@@ -590,7 +626,7 @@ namespace ForgeDeckImporter
             Assert(ForgePaths.CommanderFolder(fixtureForge) == Path.Combine(directory, "profile-user", "decks", "commander"), "Portable profile userDir was ignored.");
             File.WriteAllText(Path.Combine(fixtureForge, "forge.profile.properties"), "userDir=ignored\r\ndecksDir=" + Path.Combine(directory, "custom-decks").Replace('\\', '/') + "\r\n");
             Assert(ForgePaths.CommanderFolder(fixtureForge) == Path.Combine(directory, "custom-decks", "commander"), "Custom decksDir was ignored.");
-            return "PASS: import formats, face aliases, alternate commander metadata and eligibility, 100-card preservation, missing/repeated/primary alternate rejection, Commander serialization, safe saves, backups, and portable profiles.";
+            return "PASS: import formats, set/collector exports, Unicode accents, exact titles and face aliases, alternate commander metadata, 100-card preservation, safe saves, backups, and portable profiles.";
         }
     }
 
