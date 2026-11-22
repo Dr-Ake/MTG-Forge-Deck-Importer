@@ -1,0 +1,11 @@
+# Generated builds, release archives, and local test evidence
+/dist/
+/artifacts/
+
+# Editor and operating-system files
+.vs/
+.vscode/
+*.user
+*.suo
+Thumbs.db
+Desktop.ini
