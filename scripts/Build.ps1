@@ -27,7 +27,7 @@ foreach ($requiredFile in @($source, $icon)) {
 }
 New-Item -ItemType Directory -Path $OutputDirectory -Force | Out-Null
 $executable = Join-Path $OutputDirectory 'Forge Deck Importer.exe'
-& $compiler /nologo /target:winexe /optimize+ "/out:$executable" "/win32icon:$icon" /reference:System.Windows.Forms.dll /reference:System.Drawing.dll /reference:System.Core.dll /reference:System.IO.Compression.dll /reference:System.IO.Compression.FileSystem.dll $source
+& $compiler /nologo /target:winexe /optimize+ "/out:$executable" "/win32icon:$icon" /reference:System.Windows.Forms.dll /reference:System.Drawing.dll /reference:System.Core.dll /reference:System.IO.Compression.dll /reference:System.IO.Compression.FileSystem.dll /reference:System.Web.Extensions.dll $source
 if ($LASTEXITCODE -ne 0) { throw 'The importer did not compile.' }
 Write-Host ('Built ' + $executable)
 Write-Output $executable

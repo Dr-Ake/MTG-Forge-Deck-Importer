@@ -9,6 +9,7 @@ using System.Linq;
 using System.Reflection;
 using System.Text;
 using System.Text.RegularExpressions;
+using System.Web.Script.Serialization;
 using System.Windows.Forms;
 
 namespace ForgeDeckImporter
@@ -31,7 +32,11 @@ namespace ForgeDeckImporter
     {
         public readonly Dictionary<string, CardInfo> Cards = new Dictionary<string, CardInfo>(StringComparer.OrdinalIgnoreCase);
         private readonly Dictionary<string, CardInfo> aliases = new Dictionary<string, CardInfo>(StringComparer.OrdinalIgnoreCase);
-        private static readonly Regex PrintingSuffix = new Regex(@"\s+\([A-Za-z0-9]{2,10}\)\s+(?=[A-Za-z0-9.\-/]*\d)[A-Za-z0-9]+(?:[-./][A-Za-z0-9]+)*(?:\s+\*[FE]\*)?\s*$", RegexOptions.Compiled | RegexOptions.IgnoreCase);
+        private readonly Dictionary<string, CardInfo> flavorNames = new Dictionary<string, CardInfo>(StringComparer.OrdinalIgnoreCase);
+        private readonly HashSet<string> ambiguousFlavorNames = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        private readonly Dictionary<string, CardInfo> printedFlavorNames = new Dictionary<string, CardInfo>(StringComparer.OrdinalIgnoreCase);
+        private readonly HashSet<string> ambiguousPrintedFlavorNames = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        private static readonly Regex PrintingSuffix = new Regex(@"\s+\((?<set>[A-Za-z0-9]{2,10})\)\s+(?<collector>(?=[A-Za-z0-9.\-/]*\d)[A-Za-z0-9]+(?:[-./][A-Za-z0-9]+)*)(?:\s+\*[FE]\*)?\s*$", RegexOptions.Compiled | RegexOptions.IgnoreCase);
 
         public static string Normalize(string text)
         {
@@ -46,9 +51,81 @@ namespace ForgeDeckImporter
         public bool TryResolve(string name, out CardInfo card)
         {
             string key = Normalize(name);
-            if (Cards.TryGetValue(key, out card) || aliases.TryGetValue(FacePairKey(key), out card)) return true;
-            string withoutPrinting = PrintingSuffix.Replace(key, "");
-            return !String.Equals(key, withoutPrinting, StringComparison.Ordinal) && (Cards.TryGetValue(withoutPrinting, out card) || aliases.TryGetValue(FacePairKey(withoutPrinting), out card));
+            if (TryResolveCanonical(key, out card) || flavorNames.TryGetValue(key, out card)) return true;
+            Match printing = PrintingSuffix.Match(key);
+            if (!printing.Success) return false;
+            string withoutPrinting = key.Substring(0, printing.Index);
+            if (TryResolveCanonical(withoutPrinting, out card)) return true;
+            string printedKey = PrintedFlavorKey(withoutPrinting, printing.Groups["set"].Value, printing.Groups["collector"].Value);
+            return printedFlavorNames.TryGetValue(printedKey, out card) || flavorNames.TryGetValue(withoutPrinting, out card);
+        }
+
+        private bool TryResolveCanonical(string name, out CardInfo card)
+        {
+            return Cards.TryGetValue(Normalize(name), out card) || aliases.TryGetValue(FacePairKey(name), out card);
+        }
+
+        private static string PrintedFlavorKey(string name, string set, string collector)
+        {
+            return set.Trim() + "\u001f" + collector.Trim() + "\u001f" + Normalize(name);
+        }
+
+        private static void RegisterFlavor(Dictionary<string, CardInfo> names, HashSet<string> ambiguous, string key, CardInfo card)
+        {
+            if (ambiguous.Contains(key)) return;
+            CardInfo existing;
+            if (names.TryGetValue(key, out existing) && !String.Equals(existing.Name, card.Name, StringComparison.OrdinalIgnoreCase)) { names.Remove(key); ambiguous.Add(key); }
+            else names[key] = card;
+        }
+
+        public void AddFlavorName(string flavor, string canonical, IEnumerable<string> sets, string collector)
+        {
+            CardInfo card;
+            if (String.IsNullOrWhiteSpace(flavor) || !TryResolveCanonical(canonical, out card)) return;
+            string name = Normalize(flavor);
+            RegisterFlavor(flavorNames, ambiguousFlavorNames, name, card);
+            foreach (string set in sets.Where(s => !String.IsNullOrWhiteSpace(s)).Distinct(StringComparer.OrdinalIgnoreCase)) RegisterFlavor(printedFlavorNames, ambiguousPrintedFlavorNames, PrintedFlavorKey(name, set, collector), card);
+        }
+
+        public void LoadFlavorNames(string editionsDirectory)
+        {
+            if (!Directory.Exists(editionsDirectory)) return;
+            JavaScriptSerializer serializer = new JavaScriptSerializer();
+            foreach (string editionPath in Directory.GetFiles(editionsDirectory, "*.txt"))
+            {
+                List<string> sets = new List<string>();
+                bool metadata = false;
+                bool cards = false;
+                foreach (string raw in File.ReadLines(editionPath))
+                {
+                    string line = raw.Trim();
+                    // Printings also appear in showcase, promo, eternal, and rebalanced sections.
+                    // Every parsed row must still match an existing canonical card.
+                    if (line.StartsWith("[", StringComparison.Ordinal)) { metadata = String.Equals(line, "[metadata]", StringComparison.OrdinalIgnoreCase); cards = !metadata; continue; }
+                    if (metadata)
+                    {
+                        int equals = line.IndexOf('=');
+                        if (equals >= 0 && new[] { "Code", "Code2", "ScryfallCode", "Alias" }.Contains(line.Substring(0, equals).Trim(), StringComparer.OrdinalIgnoreCase)) sets.Add(line.Substring(equals + 1).Trim());
+                        continue;
+                    }
+                    if (!cards) continue;
+                    int jsonAt = line.IndexOf("${", StringComparison.Ordinal);
+                    if (jsonAt < 0) continue;
+                    string header = line.Substring(0, jsonAt).Trim();
+                    int artistAt = header.IndexOf(" @", StringComparison.Ordinal);
+                    if (artistAt >= 0) header = header.Substring(0, artistAt);
+                    Match entry = Regex.Match(header, @"^(?<collector>\S+)\s+\S+\s+(?<name>.+)$");
+                    if (!entry.Success) continue;
+                    try
+                    {
+                        Dictionary<string, object> details = serializer.DeserializeObject(line.Substring(jsonAt + 1)) as Dictionary<string, object>;
+                        object flavor;
+                        if (details != null && details.TryGetValue("flavorName", out flavor) && flavor is string) AddFlavorName((string)flavor, entry.Groups["name"].Value.Trim(), sets, entry.Groups["collector"].Value);
+                    }
+                    catch (ArgumentException) { }
+                    catch (InvalidOperationException) { }
+                }
+            }
         }
 
         public CardInfo AddFaces(List<string> faces, string types, string alternateMode, string frontRules = "")
@@ -112,6 +189,7 @@ namespace ForgeDeckImporter
                 if (faceTypes.TryGetValue(Normalize(copied.Value), out inherited)) { copied.Key.Basic = Regex.IsMatch(inherited, @"\bBasic\b"); copied.Key.Land = Regex.IsMatch(inherited, @"\bLand\b"); }
             }
             if (catalog.Cards.Count < 100) throw new InvalidOperationException("Forge's card database could not be read correctly. Choose a complete Forge installation.");
+            catalog.LoadFlavorNames(Path.Combine(forgeFolder, "res", "editions"));
             return catalog;
         }
     }
@@ -156,7 +234,7 @@ namespace ForgeDeckImporter
             int total = entries.Sum(e => e.Quantity);
             if (total != 100) throw new InvalidOperationException("This list has " + total + " cards. A Commander deck needs 100 cards including its commander.");
             List<string> missing = entries.Where(e => { CardInfo card; return !catalog.TryResolve(e.Name, out card); }).Select(e => e.Name).ToList();
-            if (missing.Count != 0) throw new InvalidOperationException("These cards are not in this Forge installation:\r\n\r\n" + String.Join("\r\n", missing.Take(20)) + (missing.Count > 20 ? "\r\n…and " + (missing.Count - 20) + " more." : "") + "\r\n\r\nCheck the spelling or update Forge before importing. No cards have been removed.");
+            if (missing.Count != 0) throw new InvalidOperationException("These card names could not be matched in this Forge installation:\r\n\r\n" + String.Join("\r\n", missing.Take(20)) + (missing.Count > 20 ? "\r\n…and " + (missing.Count - 20) + " more." : "") + "\r\n\r\nFor alternate printed names, include the (SET) code and collector number. Check the spelling or your Forge version. No cards have been removed.");
             entries = ResolveKnown(entries, catalog);
             CardInfo commanderCard;
             string selectedName = catalog.TryResolve(commander, out commanderCard) ? commanderCard.Name : Catalog.Normalize(commander);
@@ -562,6 +640,36 @@ namespace ForgeDeckImporter
             catalog.AddFaces(new List<string> { "Bartolom\u00e9 del Presidio" }, "Legendary Creature", "");
             List<CardEntry> accented = DeckParser.Validate("1 Bartolome\u0301 del Presidio (LCI) 224\n99 Mountain (BRO) 268", "Bartolome\u0301 del Presidio (LCI) 224", catalog);
             Assert(accented[0].Name == "Bartolom\u00e9 del Presidio", "Composed and decomposed Unicode accents did not resolve to the same name.");
+            catalog.AddFaces(new List<string> { "Other Commander" }, "Legendary Creature", "");
+            string editionDirectory = Path.Combine(directory, "edition-aliases");
+            Directory.CreateDirectory(editionDirectory);
+            File.WriteAllText(Path.Combine(editionDirectory, "aliases.txt"),
+                "[metadata]\r\nCode=TST\r\nCode2=T2\r\nScryfallCode=TSTA\r\n[cards]\r\n" +
+                "1 R Test Commander @Artist ${\"flavorName\":\"Printed Leader\"}\r\n" +
+                "2 R Test Commander @Artist ${\"flavorName\":\"Printed Leader\"}\r\n" +
+                "3 R Mountain @Artist ${\"flavorName\":\"Quoted \\\"Land\\\" \\u00e9\"}\r\n" +
+                "4 R Test Commander @Artist ${\"flavorName\":\"Shared Leader\"}\r\n" +
+                "5 R Other Commander @Artist ${\"flavorName\":\"Mountain\"}\r\n" +
+                "6 R Missing Canonical Card @Artist ${\"flavorName\":\"Invented Alias\"}\r\n" +
+                "7 R Printed Leader @Artist ${\"flavorName\":\"Chained Alias\"}\r\n" +
+                "8 R Mountain @Artist ${invalid json}\r\n" +
+                "[rebalanced]\r\nA-4 R Other Commander @Artist ${\"flavorName\":\"Shared Leader\"}\r\n" +
+                "[showcase]\r\n9 R Test Commander @Artist ${\"flavorName\":\"Showcase Leader\"}\r\n");
+            catalog.LoadFlavorNames(editionDirectory);
+            CardInfo flavorCard;
+            Assert(catalog.TryResolve("Printed Leader", out flavorCard) && flavorCard.Name == "Test Commander", "Repeated printings of the same alternate name were not resolved.");
+            Assert(catalog.TryResolve("Printed Leader (T2) 1", out flavorCard) && flavorCard.Name == "Test Commander", "Alternate edition codes were not recognized.");
+            Assert(catalog.TryResolve("Quoted \"Land\" \u00e9 (TSTA) 3", out flavorCard) && flavorCard.Name == "Mountain", "JSON quote and Unicode escapes were not decoded.");
+            Assert(!catalog.TryResolve("Shared Leader", out flavorCard), "An ambiguous printed name was guessed.");
+            Assert(catalog.TryResolve("Shared Leader (TST) 4", out flavorCard) && flavorCard.Name == "Test Commander", "A printing did not disambiguate its alternate name.");
+            Assert(catalog.TryResolve("Shared Leader (TST) A-4", out flavorCard) && flavorCard.Name == "Other Commander", "A rebalanced printing was confused with the normal card.");
+            Assert(catalog.TryResolve("Showcase Leader (TST) 9", out flavorCard) && flavorCard.Name == "Test Commander", "Alternate names in a showcase section were skipped.");
+            Assert(!catalog.TryResolve("Shared Leader (TST) 999", out flavorCard), "An unknown printing resolved an ambiguous name.");
+            Assert(catalog.TryResolve("Mountain (TST) 5", out flavorCard) && flavorCard.Name == "Mountain", "A printed alias overrode an exact canonical name.");
+            Assert(!catalog.TryResolve("Invented Alias", out flavorCard) && !catalog.TryResolve("Chained Alias", out flavorCard), "Unknown or chained aliases created unsupported cards.");
+            List<CardEntry> printedCommander = DeckParser.Validate("1 Printed Leader (TST) 1\n99 Mountain", "Printed Leader (TST) 1", catalog);
+            Assert(printedCommander[0].Name == "Test Commander" && DeckWriter.Format("Printed commander", "Test Commander", printedCommander).Contains("[Commander]\r\n1 Test Commander\r\n"), "A printed commander did not serialize using its canonical name.");
+            MustFail(delegate { DeckParser.Validate("1 Test Commander\n1 Printed Leader (TST) 1\n98 Mountain", "Test Commander", catalog); }, "Printed and canonical copies of one commander were not merged.");
             catalog.AddFaces(new List<string> { "Howlpack Piper", "Wildsong Howler" }, "Creature Human Werewolf", "DoubleFaced");
             catalog.AddFaces(new List<string> { "Fire", "Ice" }, "Instant", "Split");
             catalog.AddFaces(new List<string> { "Bonecrusher Giant", "Stomp" }, "Creature Giant", "Adventure");
@@ -626,7 +734,7 @@ namespace ForgeDeckImporter
             Assert(ForgePaths.CommanderFolder(fixtureForge) == Path.Combine(directory, "profile-user", "decks", "commander"), "Portable profile userDir was ignored.");
             File.WriteAllText(Path.Combine(fixtureForge, "forge.profile.properties"), "userDir=ignored\r\ndecksDir=" + Path.Combine(directory, "custom-decks").Replace('\\', '/') + "\r\n");
             Assert(ForgePaths.CommanderFolder(fixtureForge) == Path.Combine(directory, "custom-decks", "commander"), "Custom decksDir was ignored.");
-            return "PASS: import formats, set/collector exports, Unicode accents, exact titles and face aliases, alternate commander metadata, 100-card preservation, safe saves, backups, and portable profiles.";
+            return "PASS: import formats, printing exports, edition-backed alternate names and ambiguity checks, Unicode and face aliases, alternate commanders, 100-card preservation, safe saves, backups, and portable profiles.";
         }
     }
 

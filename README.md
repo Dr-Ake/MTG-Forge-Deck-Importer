@@ -37,7 +37,9 @@ This short example illustrates the format; import a complete 100-card deck.
 
 - Trailing backslashes copied from chat are accepted.
 - Double-faced and adventure cards can use `Front // Back`; the app saves Forge's correct card name and counts the physical card once.
-- Exports such as `1 Card Name (SET) 123` are accepted, including collector codes such as `CM2-235`. Set codes and collector numbers are ignored; Forge chooses an available printing of the named card.
+- Exports such as `1 Card Name (SET) 123` are accepted, including collector codes such as `CM2-235`. The details can disambiguate alternate printed names; Forge chooses an available printing of the underlying card.
+- Alternate printed names are loaded from Forge's installed edition files. For example, `Golbez, Clad In Darkness (FCA) 10` resolves to `Syr Konrad, the Grim`. New mappings are picked up when the app reloads an updated Forge database.
+- When one alternate name is used for different cards, include its set code and collector number. Ambiguous bare names are rejected rather than guessed.
 - Known face pairs can use a single slash, such as `Dusk / Dawn` or `Throne of the Grim Captain / The Grim Captain`.
 - Split cards such as `Fire // Ice` retain their combined name.
 - Simple headings such as `Commander (1)` and `Lands (36)`, plus Markdown code fences, are accepted.

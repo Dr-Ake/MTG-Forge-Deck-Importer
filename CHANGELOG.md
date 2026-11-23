@@ -1,5 +1,11 @@
 # Changelog
 
+## 1.0.2 — 2026-11-22
+
+- Read alternate printed names from Forge's installed edition metadata, including Golbez, Clad In Darkness for Syr Konrad, the Grim.
+- Use set codes and collector numbers to distinguish conflicting alternate names, including normal and rebalanced printings.
+- Keep exact card-name priority, reject ambiguous bare names, and improve the unmatched-name message.
+
 ## 1.0.1 — 2026-11-21
 
 - Accept exported lines containing `(SET)` codes and collector numbers, including PLST codes such as `CM2-235`.
